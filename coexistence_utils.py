@@ -2,6 +2,8 @@
 
 import numpy as np
 import scipy.sparse as sp
+import pandas as pd
+from statsmodels.stats.multitest import multipletests
 
 def calculate_coexistence_ratio(data, epsilon=1e-10):
     print(f"Input data type: {type(data)}")
@@ -237,3 +239,109 @@ def merge_matrices_with_pvalue(observed_matrices_list, expected_matrices_list, g
     
     return merged_result
 
+def add_gene_statistics(adata):
+    """
+    Add gene expression statistics to an AnnData object (supports sparse/dense matrices)
+
+    Parameters:
+    adata: input AnnData object
+
+    Returns:
+    Pandas DataFrame containing the statistics
+    """
+    # get the expression matrix
+    X = adata.X
+
+    # initialize statistics dictionary
+    stats = {
+        'mean_expression': [],
+        'expression_cell_count': [],
+        'expression_cell_ratio': [],
+        'expression_range': [],
+        'variance': []
+    }
+
+    # compute statistics for each gene
+    for gene_idx in range(X.shape[1]):
+        gene_data = X[:, gene_idx]
+
+        # compute mean
+        mean = gene_data.mean() if sp.issparse(gene_data) else gene_data.mean()
+        stats['mean_expression'].append(mean)
+
+        # number of expressing cells
+        expr_cells = gene_data.getnnz() if sp.issparse(gene_data) else np.count_nonzero(gene_data)
+        ratio = expr_cells / X.shape[0]
+        stats['expression_cell_ratio'].append(ratio)
+        stats['expression_cell_count'].append(expr_cells)
+
+        # expression range (min, max)
+        min_val = gene_data.min() if sp.issparse(gene_data) else gene_data.min()
+        max_val = gene_data.max() if sp.issparse(gene_data) else gene_data.max()
+        stats['expression_range'].append((min_val, max_val))
+
+        # variance (sparse-specialized calculation)
+        if sp.issparse(gene_data):
+            # variance = E[X^2] - (E[X])^2
+            square_data = gene_data.power(2)
+            var = square_data.mean() - mean**2
+        else:
+            var = gene_data.var()
+        stats['variance'].append(var)
+
+    # create statistics DataFrame
+    gene_stats_df = pd.DataFrame(stats, index=adata.var_names)
+    gene_stats_df.index.name = 'gene'
+
+    # add to AnnData var
+    adata.var = adata.var.assign(**gene_stats_df)
+
+    return gene_stats_df
+
+def zero_diagonal(df):
+    # ensure input is a square matrix
+    if df.shape[0] != df.shape[1]:
+        raise ValueError("Input must be a square matrix")
+
+    # operate directly on the underlying numpy array for efficiency
+    np.fill_diagonal(df.values, 0)
+    return df
+
+def symmetric_pval_to_qval(pval_matrix, method='fdr_bh'):
+    """
+    Convert a symmetric p-value DataFrame to a symmetric q-value DataFrame
+    using multiple testing correction on the upper triangle.
+
+    :param pval_matrix: symmetric p-value DataFrame
+    :param method: multiple testing correction method, default 'fdr_bh'
+    :return: symmetric q-value DataFrame
+    """
+    pval_matrix = pval_matrix.copy().astype(float)
+
+    # number of genes
+    n_genes = pval_matrix.shape[0]
+
+    # initialize all-NaN matrix (critical fix)
+    qval_matrix = pd.DataFrame(np.full((n_genes, n_genes), np.nan),
+                               index=pval_matrix.index,
+                               columns=pval_matrix.columns)
+
+    # upper triangle indices (excluding diagonal)
+    upper_indices = np.triu_indices(n_genes, k=1)
+
+    # extract upper-triangle p-values and flatten
+    pval_flat = pval_matrix.values[upper_indices]
+
+    # compute q-values (Benjamini-Hochberg correction)
+    _, qval_flat, _, _ = multipletests(pval_flat, method=method)
+
+    # fill upper triangle
+    qval_matrix.values[upper_indices] = qval_flat
+
+    # mirror to lower triangle (critical fix)
+    qval_matrix = qval_matrix.combine_first(qval_matrix.T)
+
+    # set diagonal elements
+    np.fill_diagonal(qval_matrix.values, 1.0)
+
+    return qval_matrix
