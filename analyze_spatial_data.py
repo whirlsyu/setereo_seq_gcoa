@@ -4,11 +4,14 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use('Agg')  # set backend to Agg
+from sklearn.isotonic import spearmanr
+matplotlib.use('Agg')  #  Agg
 import matplotlib.pyplot as plt
-plt.rcParams['figure.dpi'] = 300  # set figure dpi
-
-from coexistence_utils import calculate_coexistence_ratio, calculate_coexistence_ratio_probability
+import matplotlib.colors as mcolors
+from statsmodels.stats.multitest import multipletests
+plt.rcParams['figure.dpi'] = 300  #  dpi
+from cell2location.utils.filtering import filter_genes
+from coexistence_utils import calculate_coexistence_ratio, calculate_coexistence_ratio_probability, add_gene_statistics, zero_diagonal
 import seaborn as sns
 import scanpy as sc
 import anndata
@@ -41,6 +44,58 @@ def calculate_counts(adata):
         'gene': adata.var_names,
         'mean_counts': mean_counts
     }).sort_values('mean_counts', ascending=False)
+
+def calculate_coexpression_ratio(adata):
+    print(f"Detected sparse matrix: {sp.issparse(adata.X)}")
+    data = pd.DataFrame(
+        data=adata.X.toarray() if sp.issparse(adata.X) else adata.X,
+        columns=adata.var_names
+    )
+    # Initialize correlation and p-value matrices
+    n_vars = data.shape[1]
+    corr_matrix = np.zeros((n_vars, n_vars))
+    pval_matrix = np.zeros((n_vars, n_vars))
+
+    # Iterate to compute Spearman correlation and p-value for each pair of variables
+    for i in range(n_vars):
+        for j in range(i, n_vars):
+            corr, pval = spearmanr(data.iloc[:, i], data.iloc[:, j])
+            corr_matrix[i, j] = corr
+            corr_matrix[j, i] = corr
+            pval_matrix[i, j] = pval
+            pval_matrix[j, i] = pval
+
+    # Convert to DataFrame
+    corr_df = pd.DataFrame(corr_matrix, columns=data.columns, index=data.columns)
+    pval_df = pd.DataFrame(pval_matrix, columns=data.columns, index=data.columns)
+
+    # Flatten p-value matrix to 1D array (excluding diagonal)
+    p_values_flat = pval_df.stack()[pval_df.stack() != 1].reset_index(drop=True)
+    valid_p_values = p_values_flat[~p_values_flat.isna()]
+
+    # Validate input
+    n_vars = data.shape[1]
+    expected_length = n_vars * (n_vars - 1) // 2
+    if len(valid_p_values) != expected_length:
+        print(f"Warning: only detected {len(valid_p_values)} valid p-values (expected {expected_length})")
+    # Validate number of valid tests
+    if len(p_values_flat) < 1:
+        return corr_df, pval_df.fillna(1)  # If no valid p-values, return p-value matrix filled with 1
+    else:
+        # Apply Benjamini-Hochberg correction (FDR control)
+        _, corrected_pvals, _, _ = multipletests(p_values_flat, method='fdr_bh')
+
+        # Reconstruct corrected p-value matrix (fill only valid positions)
+        corrected_pval_matrix = np.full_like(pval_matrix, np.nan)
+        idx = 0
+        for i in range(n_vars):
+            for j in range(i+1, n_vars):
+                if not np.isnan(pval_df.iloc[i, j]):
+                    corrected_pval_matrix[i, j] = corrected_pvals[idx]
+                    corrected_pval_matrix[j, i] = corrected_pvals[idx]
+                    idx += 1
+        corrected_pval_df = pd.DataFrame(corrected_pval_matrix, columns=data.columns, index=data.columns)
+        return corr_df, corrected_pval_df
 
 
 def filter_and_rename_genes(adata, filter_file):
@@ -217,16 +272,18 @@ def analyze_spatial_data(input_file, output_folder, filter_file):
     # gene correlation or coexistence
     cell_types = adata_filtered.obs['cell_type'].unique()
     for cell_type in cell_types:
-        cell_type_data = adata_filtered[adata_filtered.obs['cell_type'] == cell_type].X
-        corr = pd.DataFrame(data=cell_type_data.toarray() if sp.issparse(cell_type_data) else cell_type_data, 
-                            columns=adata_filtered.var_names).corr(method='spearman')
-        
+        cell_type_data = adata_filtered[adata_filtered.obs['cell_type'] == cell_type]
+        corr, corrected_pval_df = calculate_coexpression_ratio(cell_type_data)
+        gene_stats = add_gene_statistics(cell_type_data)
+        gene_stats.to_csv(os.path.join(output_folder, f"{os.path.splitext(os.path.basename(input_file))[0]}_gene_statistics_{cell_type}.csv"))
+   
         # order genes by names
         sorted_genes = sorted(corr.columns)
         corr = corr.loc[sorted_genes, sorted_genes]
         # save correlation data
         corr.to_csv(os.path.join(output_folder, f"{os.path.splitext(os.path.basename(input_file))[0]}_correlation_{cell_type}.csv"))
-         
+        corrected_pval_df.to_csv(os.path.join(output_folder, f"{os.path.splitext(os.path.basename(input_file))[0]}_correlation_pval_{cell_type}.csv")) 
+        corr = zero_diagonal(corr)         
         plt.figure(figsize=(12, 10))
         sns.heatmap(corr, cmap='coolwarm', vmin=-1, vmax=1, xticklabels=True, yticklabels=True)
         plt.title(f'Gene Correlation Heatmap - {cell_type}')
